@@ -1,0 +1,7 @@
+telethon>=1.36,<2
+python-dotenv>=1.0
+psycopg[binary]>=3.1,<4
+# Gemini Live (real-time audio) + Telegram call audio streaming
+google-genai>=1.20,<2
+py-tgcalls>=2.2,<3
+numpy>=1.26,<3

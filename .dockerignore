@@ -1,0 +1,6 @@
+.env
+*.session
+*.session-journal
+*.sqlite3
+__pycache__/
+.git/

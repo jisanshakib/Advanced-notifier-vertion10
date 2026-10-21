@@ -1,0 +1,26 @@
+# Render Blueprint. Render > New > Blueprint > pick your GitHub repo.
+# Free plan: Render has no free "background worker", so this runs as a free web
+# service. The bot answers health checks on $PORT. Free web services sleep after
+# 15 min without visits, so add a free uptime pinger (see README).
+services:
+  - type: web
+    name: telegram-alert-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: USER_SESSION
+        sync: false
+      - key: DATABASE_URL
+        sync: false   # paste a free Postgres URL (Neon or Supabase)
+      - key: OWNER_ID
+        sync: false
+      - key: NOTIFY_CHAT_ID
+        sync: false
