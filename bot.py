@@ -7,6 +7,12 @@ import signal
 from functools import lru_cache
 
 from dotenv import load_dotenv
+
+# Load .env before importing modules that read their settings at import time
+# (db.py, transcribe.py and voice_call.py). Otherwise GEMINI_API_KEY/DATABASE_URL
+# set only in .env are invisible and voice stays disabled.
+load_dotenv()
+
 from telethon import Button, TelegramClient, events, types as tltypes
 from telethon.errors import FloodWaitError, MessageNotModifiedError, UserAlreadyParticipantError
 from telethon.sessions import StringSession
@@ -17,8 +23,6 @@ import caller
 import db
 import transcribe
 import voice_call
-
-load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
 
