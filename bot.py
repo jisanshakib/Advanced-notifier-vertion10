@@ -187,9 +187,13 @@ def summary_text():
 # ------------------------------------------------------------------ callbacks
 @bot.on(events.CallbackQuery())
 async def on_cb(event):
+    return await dispatch_callback(event, event.data.decode())
+
+
+async def dispatch_callback(event, data):
+    """Route callbacks without modifying Telethon's read-only event.data."""
     if not is_owner(event.sender_id):
         return await event.answer("⛔ Private bot", alert=True)
-    data = event.data.decode()
     cid = event.chat_id
     state.pop(cid, None)
     try:
@@ -220,15 +224,13 @@ async def on_cb(event):
         return await show(event, summary_text(), [
             [Button.inline("🔄 Refresh", b"sum_r"), Button.inline("🗑 Reset stats", b"sum_reset")], back()[1:]])
     if data == "sum_r":
-        event.data = b"sum"
-        return await on_cb(event)
+        return await dispatch_callback(event, "sum")
     if data == "sum_reset":
         return await show(event, "⚠️ <b>Reset all summary statistics?</b>\nKeywords and channels are NOT touched.",
                           [[Button.inline("✅ Yes, reset", b"sum_reset_ok"), Button.inline("❌ No", b"sum")]])
     if data == "sum_reset_ok":
         db.hits_reset()
-        event.data = b"sum"
-        return await on_cb(event)
+        return await dispatch_callback(event, "sum")
 
     # ---- channels
     if data == "ch":
@@ -269,8 +271,7 @@ async def on_cb(event):
         except Exception as e:
             log.info("leave channel %s: %s", ch_id, e)
         await event.respond(f"✅ Removed <b>{html.escape(r['title'] if r else str(ch_id))}</b>.", parse_mode="html")
-        event.data = b"ch_del"
-        return await on_cb(event)
+        return await dispatch_callback(event, "ch_del")
 
     # ---- keywords (normal + priority share the same screens)
     for prefix, table, title, parent in (("kw", KW, "Keyword", "kw"), ("pk", PKW, "Priority Keyword", "pr")):
@@ -306,8 +307,7 @@ async def on_cb(event):
                 [back(f"{prefix}_edit")])
         if data.startswith(f"{prefix}d:"):
             db.kw_del(table, int(data.split(":")[1]))
-            event.data = f"{prefix}_edit".encode()
-            return await on_cb(event)
+            return await dispatch_callback(event, f"{prefix}_edit")
 
     if data == "kw":
         return await show(event,
@@ -343,8 +343,7 @@ async def on_cb(event):
             btns + [back("pr")])
     if data.startswith("prt:"):
         db.toggle_priority(int(data[4:]))
-        event.data = b"pr_ch"
-        return await on_cb(event)
+        return await dispatch_callback(event, "pr_ch")
     if data == "pr_target":
         state[cid] = ("pr_target", None)
         return await show(event,

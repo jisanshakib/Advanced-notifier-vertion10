@@ -10,7 +10,7 @@ import os
 log = logging.getLogger("transcribe")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-MODEL = os.getenv("GEMINI_TRANSCRIBE_MODEL", "gemini-2.5-flash").strip()
+MODEL = os.getenv("GEMINI_TRANSCRIBE_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
 
 PROMPT = (
     "Transcribe this audio exactly as spoken, word for word, in its original language "
