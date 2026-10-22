@@ -9,8 +9,8 @@ from functools import lru_cache
 from dotenv import load_dotenv
 
 # Load .env before importing modules that read their settings at import time
-# (db.py, transcribe.py and voice_call.py). Otherwise GEMINI_API_KEY/DATABASE_URL
-# set only in .env are invisible and voice stays disabled.
+# (db.py, transcribe.py and voice_call.py). Otherwise GROQ_API_KEY/GEMINI_API_KEY/
+# DATABASE_URL set only in .env are invisible and voice stays disabled.
 load_dotenv()
 
 from telethon import Button, TelegramClient, events, types as tltypes
@@ -97,7 +97,7 @@ MAIN_TEXT = (
     "⭐ If the post comes from a <b>Priority Channel</b> AND contains a <b>Priority Keyword</b>, "
     "it's marked PRIORITY and I <b>call your Telegram</b>: 1st call → if you hang up I stop; "
     "if you ignore it, I call a 2nd time.\n\n"
-    "🎙 <b>Voice messages</b> are transcribed with Gemini and checked against your keywords. "
+    "🎙 <b>Voice messages</b> are transcribed with Groq Whisper and checked against your keywords. "
     "If a voice contains a <b>Priority Keyword</b>, the voice is forwarded here immediately.\n\n"
     "Choose an option below 👇"
 )
@@ -536,7 +536,7 @@ async def on_post(event):
 
 
 DOWNLOAD_TIMEOUT = 120    # seconds; a stuck download must never block alerts
-TRANSCRIBE_TIMEOUT = 120  # seconds for Gemini to answer
+TRANSCRIBE_TIMEOUT = 120  # seconds for Groq to answer
 _voice_slots = asyncio.Semaphore(2)  # at most 2 voices processed at once (keeps memory low)
 CAPTION_LIMIT = 1024  # Telegram's max caption length
 
@@ -595,6 +595,7 @@ def post_link(ch, msg_id):
 
 
 MAX_VOICE_SECONDS = 180  # voices longer than 3 minutes are skipped
+GROQ_MAX_BYTES = min(MAX_MEDIA_BYTES, 25 * 1024 * 1024)  # Groq Whisper rejects files over 25 MB
 
 
 def voice_duration(event):
@@ -607,9 +608,9 @@ def voice_duration(event):
 
 
 async def on_voice_post(event, ch, caption):
-    """Voice/audio post: transcribe with Gemini, match keywords, forward the voice.
-    - Priority keyword in the voice  -> forwarded IMMEDIATELY to the notification chat (any watched channel).
-      If the channel is also a Priority Channel, the call sequence runs as before.
+    """Voice/audio post: transcribe with Groq Whisper, match keywords, forward the voice.
+    - Priority keyword in the voice  -> forwarded IMMEDIATELY to the notification chat (any watched channel)
+      AND the live call alert runs, whatever the channel's priority setting.
     - Normal keyword only            -> forwarded as a normal alert."""
     dest = notify_chat()
     duration = voice_duration(event)
@@ -617,11 +618,11 @@ async def on_voice_post(event, ch, caption):
         log.info("voice skipped: %ss is longer than the %ss limit", duration, MAX_VOICE_SECONDS)
         return
     size = (event.file.size or 0) if event.file is not None else 0
-    if size > MAX_MEDIA_BYTES:
+    if size > GROQ_MAX_BYTES:
         log.info("voice too large to transcribe (%s bytes)", size)
         return
     if not transcribe.AVAILABLE:
-        log.info("voice post skipped: GEMINI_API_KEY not set")
+        log.info("voice post skipped: GROQ_API_KEY not set")
         return
     async with _voice_slots:
         try:
@@ -662,7 +663,7 @@ async def on_voice_post(event, ch, caption):
         log.exception("voice forward failed: %s", e)
         await safe_send(dest, caption_html, parse_mode="html", link_preview=False)
 
-    if is_priority and ch["priority"]:
+    if is_priority:
         target = db.get_setting("call_target")
         if target:
             spawn(run_call(target, ch["title"], full_text))
@@ -778,7 +779,7 @@ async def main():
         log.exception("voice call setup failed, ring-only mode: %s", e)
         voice_call.AVAILABLE = False
     me = await user.get_me()
-    log.info("Voice transcription: %s", "ON (" + transcribe.MODEL + ")" if transcribe.AVAILABLE else "OFF (no GEMINI_API_KEY)")
+    log.info("Voice transcription: %s", "ON (" + transcribe.MODEL + ")" if transcribe.AVAILABLE else "OFF (no GROQ_API_KEY)")
     log.info("Userbot: %s | Bot: @%s", me.first_name, (await bot.get_me()).username)
     runners = [asyncio.create_task(user.run_until_disconnected()),
                asyncio.create_task(bot.run_until_disconnected()),

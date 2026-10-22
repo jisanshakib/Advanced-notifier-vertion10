@@ -1,37 +1,48 @@
-"""Voice-message transcription with Gemini (google-genai).
+"""Voice-message transcription with Groq Whisper (whisper-large-v3-turbo).
 
 Used by bot.py: when a watched channel posts a voice/audio message, the audio is sent to
-Gemini, and the returned transcript is matched against the saved keywords exactly like text.
-If GEMINI_API_KEY is missing, transcription is skipped and the rest of the bot keeps working.
+Groq's Whisper API, and the returned transcript is matched against the saved keywords
+exactly like text. If GROQ_API_KEY is missing, transcription is skipped and the rest of
+the bot keeps working. Live Telegram calls still use Gemini (voice_call.py) — untouched.
 """
 import logging
 import os
 
 log = logging.getLogger("transcribe")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-MODEL = os.getenv("GEMINI_TRANSCRIBE_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
-
-PROMPT = (
-    "Transcribe this audio exactly as spoken, word for word, in its original language "
-    "(do not translate). Return only the transcript text, no notes or timestamps. "
-    "If there is no speech, return an empty response."
-)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+MODEL = os.getenv("GROQ_TRANSCRIBE_MODEL", "whisper-large-v3-turbo").strip() or "whisper-large-v3-turbo"
 
 _client = None
 try:
-    from google import genai
-    from google.genai import types as gtypes
-    AVAILABLE = bool(GEMINI_API_KEY)
+    from groq import AsyncGroq
+    AVAILABLE = bool(GROQ_API_KEY)
 except Exception as e:  # library missing -> feature off, bot still runs
-    log.warning("google-genai not available, voice transcription disabled: %s", e)
+    log.warning("groq not available, voice transcription disabled: %s", e)
     AVAILABLE = False
+
+# Groq Whisper accepts these containers; anything else is sent as .ogg (Telegram voice).
+_EXT = {
+    "audio/ogg": ".ogg",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/webm": ".webm",
+    "audio/flac": ".flac",
+}
+
+
+def _filename(mime_type: str) -> str:
+    ext = _EXT.get((mime_type or "").split(";")[0].strip().lower(), ".ogg")
+    return "voice" + ext
 
 
 def _get_client():
     global _client
     if _client is None:
-        _client = genai.Client(api_key=GEMINI_API_KEY)
+        _client = AsyncGroq(api_key=GROQ_API_KEY)
     return _client
 
 
@@ -39,8 +50,9 @@ async def transcribe(data: bytes, mime_type: str = "audio/ogg") -> str:
     """Return the transcript ('' when unavailable/silent). Raises on API errors."""
     if not AVAILABLE or not data:
         return ""
-    resp = await _get_client().aio.models.generate_content(
+    resp = await _get_client().audio.transcriptions.create(
+        file=(_filename(mime_type), data),
         model=MODEL,
-        contents=[PROMPT, gtypes.Part.from_bytes(data=data, mime_type=mime_type or "audio/ogg")],
+        response_format="json",
     )
     return (getattr(resp, "text", None) or "").strip()

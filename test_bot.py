@@ -110,3 +110,44 @@ def test_flows():
     # 6. long lists stay under Telegram's limit
     assert len(bot.clip_lines(["• word"] * 2000, "")) < 4096
 test_flows(); print("FLOW TESTS PASS")
+
+
+def test_voice_priority_call_and_groq_limit():
+    import asyncio
+    from types import SimpleNamespace as N
+    calls, spawned = [], []
+    async def send_file(dest, f, **kw): calls.append(("file", kw)); return N(id=1)
+    async def send_message(*a, **kw): calls.append(("msg", a, kw)); return N(id=2)
+    async def upload_file(data, **kw): return "F"
+    bot.bot.send_file, bot.bot.send_message, bot.bot.upload_file = send_file, send_message, upload_file
+    async def dl(*a, **k): return b"voice"
+    bot.user.download_media = dl
+    bot.NOTIFY_CHAT = "12345"
+    bot.transcribe.AVAILABLE = True
+    bot.TRANSCRIBE_TIMEOUT = 120
+    async def tr(data, mime): return "nothing interesting here"
+    bot.transcribe.transcribe = tr
+    bot.spawn = lambda coro: (spawned.append(coro), coro.close())[0]
+    db.kw_add("priority_keywords", "urgent")
+    db.set_setting("call_target", "999")
+    ch = {"title": "C", "id": 1, "username": None, "priority": 0}  # NOT a priority channel
+    ev = N(file=N(duration=10, size=10, mime_type="audio/ogg", name=None, ext=".ogg"), voice=1, id=5, message=None)
+    # 1. priority keyword in the CAPTION (transcript has none) still matches, forwards, and calls
+    asyncio.run(bot.on_voice_post(ev, ch, "urgent update"))
+    assert [c[0] for c in calls] == ["file"], calls
+    assert len(spawned) == 1, "priority keyword must trigger the call from any watched channel"
+    # 2. file over Groq's 25 MB limit is skipped before download
+    calls.clear(); spawned.clear(); downloaded = []
+    async def dl2(*a, **k): downloaded.append(1); return b"v"
+    bot.user.download_media = dl2
+    big = N(file=N(duration=10, size=26 * 1024 * 1024), voice=1, id=6, message=None)
+    asyncio.run(bot.on_voice_post(big, ch, "urgent"))
+    assert not downloaded and not calls
+    # 3. Groq rate-limit/failure -> voice skipped silently, bot keeps running
+    async def boom(*a, **k): raise RuntimeError("rate limited")
+    bot.transcribe.transcribe = boom
+    bot.user.download_media = dl
+    calls.clear()
+    asyncio.run(bot.on_voice_post(ev, ch, "urgent"))
+    assert not calls
+test_voice_priority_call_and_groq_limit(); print("VOICE PRIORITY/GROQ LIMIT TESTS PASS")

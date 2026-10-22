@@ -88,17 +88,18 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
                                 file=SimpleNamespace(duration=180, size=5,
                                                      mime_type="audio/ogg", name="voice.ogg", ext=".ogg"))
         channel = {"id": 105, "title": "Voice test", "username": None, "priority": 0}
-        generate = AsyncMock(return_value=SimpleNamespace(text="spokenword"))
-        client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=generate)))
+        create = AsyncMock(return_value=SimpleNamespace(text="spokenword"))
+        client = SimpleNamespace(audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create)))
         send = AsyncMock()
         with patch.object(bot.transcribe, "AVAILABLE", True), \
-             patch.object(bot.transcribe, "MODEL", "gemini-3.8-flash"), \
+             patch.object(bot.transcribe, "MODEL", "whisper-large-v3-turbo"), \
              patch.object(bot.transcribe, "_get_client", return_value=client), \
              patch.object(bot.user, "download_media", AsyncMock(return_value=b"audio")), \
              patch.object(bot.bot, "upload_file", AsyncMock(return_value="uploaded")), \
              patch.object(bot.bot, "send_file", send):
             await bot.on_voice_post(event, channel, "captionword")
-        self.assertEqual(generate.await_args.kwargs["model"], "gemini-3.8-flash")
+        self.assertEqual(create.await_args.kwargs["model"], "whisper-large-v3-turbo")
+        self.assertEqual(create.await_args.kwargs["file"], ("voice.ogg", b"audio"))
         send.assert_awaited_once()
         self.assertTrue(send.await_args.kwargs["voice_note"])
         self.assertIn("spokenword", send.await_args.kwargs["caption"])

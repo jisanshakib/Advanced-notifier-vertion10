@@ -29,6 +29,8 @@ Create a **private** repo and upload all files in this folder (`.gitignore` keep
 2. (Optional) + New → Database → PostgreSQL, then in the bot service → Variables →
    add `DATABASE_URL` = `${{Postgres.DATABASE_URL}}`.
 3. Variables → add `API_ID`, `API_HASH`, `BOT_TOKEN`, `USER_SESSION` (and `DATABASE_URL` if from Neon/Supabase).
+   For voice-message transcription add `GROQ_API_KEY` (https://console.groq.com/keys);
+   for AI voice on priority calls add `GEMINI_API_KEY`.
 4. Deploy. Check **Deployments → Logs** for `Userbot: … | Bot: @…`.
 
 Note: Railway gives trial credit, then about $5/month on the Hobby plan. A bot like this uses very little.
