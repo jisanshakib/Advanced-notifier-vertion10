@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import signal
+from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
 from dotenv import load_dotenv
@@ -14,7 +16,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from telethon import Button, TelegramClient, events, types as tltypes
-from telethon.errors import FloodWaitError, MessageNotModifiedError, UserAlreadyParticipantError
+from telethon.errors import (FloodWaitError, MessageNotModifiedError, RPCError, ServerError,
+                             UserAlreadyParticipantError)
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
@@ -22,6 +25,7 @@ from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInv
 import caller
 import db
 import transcribe
+import matching
 import voice_call
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
@@ -36,9 +40,13 @@ NOTIFY_CHAT = os.getenv("NOTIFY_CHAT_ID", "").strip()
 # session string (create it once with: python login_session.py). Falls back to a local file.
 _USER_SESSION = os.getenv("USER_SESSION", "").strip()
 # flood_sleep_threshold: Telethon auto-waits FloodWaits up to 2 min instead of raising
-bot = TelegramClient(StringSession(), API_ID, API_HASH, flood_sleep_threshold=120)
+# connection_retries=-1 + auto_reconnect: never give up on a dropped socket / DC migration.
+# catch_up=True: after a reconnect Telethon fetches the updates missed while offline.
+_CLIENT_OPTS = dict(flood_sleep_threshold=120, connection_retries=-1, retry_delay=3,
+                    auto_reconnect=True, request_retries=5)
+bot = TelegramClient(StringSession(), API_ID, API_HASH, **_CLIENT_OPTS)
 user = TelegramClient(StringSession(_USER_SESSION) if _USER_SESSION else "user_session", API_ID, API_HASH,
-                      flood_sleep_threshold=120)
+                      catch_up=True, **_CLIENT_OPTS)
 
 MAX_MEDIA_BYTES = int(os.getenv("MAX_MEDIA_MB", "40") or 40) * 1024 * 1024  # Render free = 512 MB RAM
 _bg_tasks: set[asyncio.Task] = set()
@@ -58,19 +66,35 @@ def spawn(coro):
     return t
 
 
-async def safe_send(*args, **kw):
-    """bot.send_message that never raises: retries once after a long FloodWait."""
-    for attempt in (1, 2):
+TG_ATTEMPTS = 4
+MAX_FLOOD_WAIT = 600
+
+
+async def tg_retry(fn, *args, **kw):
+    """Call a Telegram API coroutine, waiting out FloodWaits and retrying transient
+    network/server errors with backoff. Permanent errors are raised immediately."""
+    for attempt in range(1, TG_ATTEMPTS + 1):
         try:
-            return await bot.send_message(*args, **kw)
+            return await fn(*args, **kw)
         except FloodWaitError as e:
-            if attempt == 2 or e.seconds > 600:
-                log.warning("send gave up after FloodWait %ss", e.seconds)
-                return None
+            if attempt == TG_ATTEMPTS or e.seconds > MAX_FLOOD_WAIT:
+                raise
+            log.warning("FloodWait %ss on %s, waiting", e.seconds, getattr(fn, "__name__", fn))
             await asyncio.sleep(e.seconds + 1)
-        except Exception as e:
-            log.warning("send_message failed: %s", e)
-            return None
+        except (ServerError, ConnectionError, OSError, asyncio.TimeoutError) as e:
+            if attempt == TG_ATTEMPTS:
+                raise
+            log.warning("transient error on %s (%r), retry %s", getattr(fn, "__name__", fn), e, attempt)
+            await asyncio.sleep(min(2 ** attempt, 15))
+
+
+async def safe_send(*args, **kw):
+    """bot.send_message that never raises (retries FloodWait/transient errors first)."""
+    try:
+        return await tg_retry(bot.send_message, *args, **kw)
+    except Exception as e:
+        log.warning("send_message failed: %s", e)
+        return None
 
 state: dict[int, tuple] = {}  # chat_id -> (action, extra)
 
@@ -98,7 +122,7 @@ MAIN_TEXT = (
     "it's marked PRIORITY and I <b>call your Telegram</b>: 1st call → if you hang up I stop; "
     "if you ignore it, I call a 2nd time.\n\n"
     "🎙 <b>Voice messages</b> are transcribed with Groq Whisper and checked against your keywords. "
-    "If a voice contains a <b>Priority Keyword</b>, the voice is forwarded here immediately.\n\n"
+    "Calls happen only for a <b>Priority Channel</b> + <b>Priority Keyword</b> — for voices too.\n\n"
     "Choose an option below 👇"
 )
 MAIN_BTNS = [
@@ -482,20 +506,96 @@ def kw_match(word, text):
     return _kw_pattern(w).search(text) is not None
 
 
-def find(text, table):
+def find(text, table, fuzzy=False):
+    """fuzzy=True (voice transcripts): normalized + fuzzy match via matching.py, tolerant of
+    Banglish, dialects and slurred speech. Text posts keep the strict whole-word match."""
     try:
+        if fuzzy:
+            return [r["word"] for r in db.kw_list(table)
+                    if kw_match(r["word"], text) or matching.fuzzy_match(r["word"], text)]
         return [r["word"] for r in db.kw_list(table) if kw_match(r["word"], text)]
     except Exception as e:  # DB hiccup must not kill the handler
         log.warning("keyword lookup failed: %s", e)
         return []
 
 
+# ---- reliable intake: realtime events + catch-up poller -> dedupe -> queue -> workers
+ALERT_WORKERS = max(1, int(os.getenv("ALERT_WORKERS", "3") or 3))
+POLL_INTERVAL = max(5, int(os.getenv("POLL_INTERVAL", "20") or 20))  # safety-net poll per channel
+JOB_TIMEOUT = 600   # one stuck post can never block a worker forever
+SEEN_MAX = 20000
+_seen: "OrderedDict[tuple, None]" = OrderedDict()   # (channel_id, msg_id) already queued
+_last_id: dict[int, int] = {}                       # newest msg id seen per channel
+_queue: asyncio.Queue | None = None
+
+
+def get_queue() -> asyncio.Queue:
+    global _queue
+    if _queue is None:
+        _queue = asyncio.Queue()
+    return _queue
+
+
+def channel_id_of(msg) -> int | None:
+    peer = getattr(msg, "peer_id", None)
+    return getattr(peer, "channel_id", None)
+
+
+def enqueue(ch_id, msgs, source="live") -> bool:
+    """Queue a post (single message or whole album) once. Returns False for duplicates.
+    Synchronous, so two sources (event + poller) can never queue the same post twice."""
+    msgs = [m for m in msgs if m is not None]
+    new = [m for m in msgs if (ch_id, m.id) not in _seen]
+    if not new:
+        return False
+    for m in new:
+        _seen[(ch_id, m.id)] = None
+        _last_id[ch_id] = max(_last_id.get(ch_id, 0), m.id)
+    while len(_seen) > SEEN_MAX:
+        _seen.popitem(last=False)
+    get_queue().put_nowait((ch_id, sorted(new, key=lambda m: m.id), source))
+    return True
+
+
 @user.on(events.NewMessage())
 async def on_post(event):
+    """Realtime intake. Only enqueues — heavy work happens in the workers, so a burst
+    of posts from many channels at the same second is never dropped."""
     if not event.is_channel:
         return
-    peer = event.message.peer_id
-    ch_id = getattr(peer, "channel_id", None) or abs(event.chat_id)
+    msg = event.message
+    if getattr(msg, "grouped_id", None):
+        return  # album part: handled once, as a whole, by on_album
+    ch_id = channel_id_of(msg) or abs(event.chat_id)
+    enqueue(ch_id, [msg])
+
+
+@user.on(events.Album())
+async def on_album(event):
+    if not event.is_channel:
+        return
+    msgs = list(event.messages)
+    if not msgs:
+        return
+    ch_id = channel_id_of(msgs[0]) or abs(event.chat_id)
+    enqueue(ch_id, msgs)
+
+
+async def alert_worker(n):
+    q = get_queue()
+    while True:
+        ch_id, msgs, source = await q.get()
+        try:
+            await asyncio.wait_for(handle_job(ch_id, msgs, source), JOB_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # log and keep monitoring
+            log.exception("worker %s: post %s/%s failed: %r", n, ch_id, msgs[0].id, e)
+        finally:
+            q.task_done()
+
+
+async def handle_job(ch_id, msgs, source="live"):
     try:
         ch = db.channel(ch_id)
     except Exception as e:
@@ -503,9 +603,66 @@ async def on_post(event):
         return
     if not ch:
         return
-    text = event.raw_text or ""
-    if event.voice or event.audio:
-        return await on_voice_post(event, ch, text)
+    if source == "poll":
+        log.info("catch-up poller recovered post %s in %s", msgs[0].id, ch["title"])
+    await process_post(ch, msgs)
+
+
+async def poll_once():
+    """Safety net for updates Telegram never pushed (gaps, reconnects, lazy big channels):
+    fetch anything newer than the last seen id for every watched channel."""
+    try:
+        rows = db.channels()
+    except Exception as e:
+        log.warning("poller: channel list failed: %s", e)
+        return
+    settle = datetime.now(timezone.utc) - timedelta(seconds=4)  # let albums finish uploading
+    for r in rows:
+        cid = r["id"]
+        try:
+            peer = tltypes.PeerChannel(cid)
+            if cid not in _last_id:  # first sight: start from now, don't replay history
+                latest = await user.get_messages(peer, limit=1)
+                _last_id[cid] = max(_last_id.get(cid, 0), latest[0].id if latest else 0)
+                continue
+            got = await user.get_messages(peer, min_id=_last_id[cid], limit=50)
+            fresh = sorted((m for m in got if m and m.date and m.date <= settle), key=lambda m: m.id)
+            groups: "OrderedDict[object, list]" = OrderedDict()
+            for m in fresh:
+                groups.setdefault(m.grouped_id or ("single", m.id), []).append(m)
+            for g in groups.values():
+                enqueue(cid, g, "poll")
+        except FloodWaitError as e:
+            log.warning("poller FloodWait %ss", e.seconds)
+            await asyncio.sleep(min(e.seconds + 1, MAX_FLOOD_WAIT))
+        except Exception as e:
+            log.debug("poller %s: %r", cid, e)
+        await asyncio.sleep(0.3)  # gentle on the API with many channels
+
+
+async def poller():
+    while True:
+        try:
+            await poll_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("poller error (ignored): %r", e)
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+def _caption_of(msgs):
+    for m in msgs:
+        if (m.raw_text or "").strip():
+            return m.raw_text
+    return ""
+
+
+async def process_post(ch, msgs):
+    first = msgs[0]
+    text = _caption_of(msgs)
+    if len(msgs) == 1 and (first.voice or first.audio):
+        return await on_voice_post(first, ch, text)
     if not text.strip():
         return  # media-only post: nothing to match
     normal = find(text, KW)
@@ -515,24 +672,24 @@ async def on_post(event):
         return
     record_hits(ch, normal, prio if is_priority else [], "text")
 
-    link = (f"https://t.me/{ch['username']}/{event.id}" if ch["username"]
-            else f"https://t.me/c/{ch['id']}/{event.id}")
+    link = post_link(ch, first.id)
     head = ("🚨🚨 <b>PRIORITY ALERT</b> 🚨🚨\n" if is_priority else "📨 <b>New matching post</b>\n")
     head += (f"📢 <b>Channel:</b> {html.escape(ch['title'])}\n"
              f"🔑 <b>Matched:</b> {html.escape(', '.join(dict.fromkeys(prio + normal)))}\n"
              f"🔗 <a href=\"{link}\">Open original post</a>\n\n")
     dest = notify_chat()
-    try:
-        await send_alert(event, dest, head, text)
-    except Exception as e:
-        log.exception("forward failed: %s", e)
-
+    # Call first: it is the most time-critical part and must not wait for media uploads.
     if is_priority:
         target = db.get_setting("call_target")
         if target:
             spawn(run_call(target, ch["title"], text))
         else:
             await safe_send(dest, "⚠️ Priority matched but no call target is set (⭐ Priority Settings).")
+    try:
+        await send_alert(msgs, dest, head, text)
+    except Exception as e:
+        log.exception("forward failed: %s", e)
+        await safe_send(dest, build_body(head, text, 3900), parse_mode="html", link_preview=False)
 
 
 DOWNLOAD_TIMEOUT = 120    # seconds; a stuck download must never block alerts
@@ -561,23 +718,60 @@ def build_body(head, text, limit):
     return head + html.escape(cut) + suffix
 
 
-async def send_alert(event, dest, head, text):
-    """Send the alert as ONE message: media with the text as its caption when possible,
-    otherwise a plain text message."""
-    has_media = event.media and event.file is not None and not event.web_preview
-    size = (event.file.size or 0) if has_media else 0
-    if has_media and size <= MAX_MEDIA_BYTES:
+def _media_ok(m):
+    return bool(m.media and m.file is not None and not m.web_preview)
+
+
+def _fname(m, default="media"):
+    return getattr(m.file, "name", None) or f"{default}{m.file.ext or ''}"
+
+
+async def _download(m):
+    return await asyncio.wait_for(tg_retry(user.download_media, m, file=bytes), DOWNLOAD_TIMEOUT)
+
+
+async def send_alert(msgs, dest, head, text):
+    """Send the alert as ONE post: a single media / grouped album with the alert as caption,
+    otherwise a plain text message. Media bytes are released right after upload."""
+    if not isinstance(msgs, (list, tuple)):
+        msgs = [msgs]
+    media = [m for m in msgs if _media_ok(m)]
+    fits = [m for m in media if (m.file.size or 0) <= MAX_MEDIA_BYTES]
+    too_big = len(fits) < len(media)
+    caption = build_body(head, text, CAPTION_LIMIT)
+    if len(fits) > 1:  # album: photos/videos together in one grouped post (max 10 per album)
         try:
-            data = await asyncio.wait_for(user.download_media(event.message, file=bytes), DOWNLOAD_TIMEOUT)
+            uploaded = []
+            for m in fits[:10]:
+                data = await _download(m)
+                if data:
+                    name = f"photo{len(uploaded)}.jpg" if m.photo else _fname(m)
+                    uploaded.append(await tg_retry(bot.upload_file, data, file_name=name))
+                data = None  # free memory immediately
+            if len(uploaded) > 1:
+                caps = [caption] + [""] * (len(uploaded) - 1)
+                sent = await tg_retry(bot.send_file, dest, uploaded, caption=caps, parse_mode="html")
+                if len(fits) > 10:
+                    await safe_send(dest, "📎 <i>Album has more than 10 items — open the original post.</i>",
+                                    parse_mode="html")
+                return sent
+            if len(uploaded) == 1:
+                return await tg_retry(bot.send_file, dest, uploaded[0], caption=caption, parse_mode="html")
+        except Exception as e:
+            log.warning("album send failed, falling back to text: %s", e)
+    elif len(fits) == 1:
+        m = fits[0]
+        try:
+            data = await _download(m)
             if data:
-                f = await bot.upload_file(data, file_name=getattr(event.file, "name", None) or f"media{event.file.ext or ''}")
-                return await bot.send_file(dest, f, caption=build_body(head, text, CAPTION_LIMIT),
-                                           parse_mode="html",
-                                           force_document=not (event.photo or event.video))
+                f = await tg_retry(bot.upload_file, data, file_name=_fname(m))
+                data = None
+                return await tg_retry(bot.send_file, dest, f, caption=caption, parse_mode="html",
+                                      force_document=not (m.photo or m.video))
         except Exception as e:
             log.warning("media+caption send failed, falling back to text: %s", e)
     full = build_body(head, text, 3900)
-    if has_media and size > MAX_MEDIA_BYTES:
+    if too_big:
         full += "\n\n📎 <i>Media too large to forward — open the original post.</i>"
     return await safe_send(dest, full, parse_mode="html", link_preview=False)
 
@@ -607,11 +801,16 @@ def voice_duration(event):
         return None
 
 
+def _msg_of(event):
+    """Telethon event -> its Message; a Message (whose .message is the text) -> itself."""
+    m = getattr(event, "message", None)
+    return event if (m is None or isinstance(m, str)) else m
+
+
 async def on_voice_post(event, ch, caption):
     """Voice/audio post: transcribe with Groq Whisper, match keywords, forward the voice.
-    - Priority keyword in the voice  -> forwarded IMMEDIATELY to the notification chat (any watched channel)
-      AND the live call alert runs, whatever the channel's priority setting.
-    - Normal keyword only            -> forwarded as a normal alert."""
+    STRICT rule: PRIORITY + call only when Priority Channel = YES AND Priority Keyword = YES.
+    A priority keyword heard on a non-priority channel is forwarded as a normal alert (no call)."""
     dest = notify_chat()
     duration = voice_duration(event)
     if duration is not None and duration > MAX_VOICE_SECONDS:
@@ -624,9 +823,15 @@ async def on_voice_post(event, ch, caption):
     if not transcribe.AVAILABLE:
         log.info("voice post skipped: GROQ_API_KEY not set")
         return
+    try:  # saved keywords guide Whisper's spelling (priority first)
+        transcribe.KEYWORD_HINTS = [r["word"] for r in db.kw_list(PKW)] + [r["word"] for r in db.kw_list(KW)]
+    except Exception as e:
+        log.warning("keyword hints unavailable: %s", e)
+        transcribe.KEYWORD_HINTS = []
     async with _voice_slots:
         try:
-            data = await asyncio.wait_for(user.download_media(event.message, file=bytes), DOWNLOAD_TIMEOUT)
+            data = await asyncio.wait_for(tg_retry(user.download_media, _msg_of(event), file=bytes),
+                                          DOWNLOAD_TIMEOUT)
         except Exception as e:
             log.warning("voice download failed: %r", e)
             return
@@ -641,11 +846,13 @@ async def on_voice_post(event, ch, caption):
     full_text = "\n".join(t for t in (caption.strip(), transcript) if t)
     if not full_text:
         return
-    normal = find(full_text, KW)
-    prio = find(full_text, PKW)
+    normal = find(full_text, KW, fuzzy=True)
+    prio = find(full_text, PKW, fuzzy=True)
     if not normal and not prio:
         return
-    is_priority = bool(prio)
+    is_priority = bool(ch["priority"] and prio)
+    if not is_priority:  # strict rule: no priority without a priority channel
+        normal, prio = list(dict.fromkeys(prio + normal)), []
     record_hits(ch, normal, prio, "voice")
 
     link = post_link(ch, event.id)
@@ -655,8 +862,11 @@ async def on_voice_post(event, ch, caption):
              f"🔗 <a href=\"{link}\">Open original post</a>\n\n📝 <b>Transcript:</b>\n")
     caption_html = build_body(head, full_text, CAPTION_LIMIT)
     try:
-        f = await bot.upload_file(data, file_name=getattr(event.file, "name", None) or f"voice{event.file.ext or '.ogg'}")
-        await bot.send_file(dest, f, caption=caption_html, parse_mode="html", voice_note=bool(event.voice))
+        f = await tg_retry(bot.upload_file, data,
+                           file_name=getattr(event.file, "name", None) or f"voice{event.file.ext or '.ogg'}")
+        data = None  # free the audio bytes right away
+        await tg_retry(bot.send_file, dest, f, caption=caption_html, parse_mode="html",
+                       voice_note=bool(event.voice))
         if len(full_text) > 600:  # long transcript: send it in full as a separate message
             await safe_send(dest, "📝 <b>Full transcript</b>\n\n" + html.escape(full_text[:3900]), parse_mode="html")
     except Exception as e:
@@ -778,6 +988,17 @@ async def main():
     except Exception as e:  # never let the voice add-on stop the bot
         log.exception("voice call setup failed, ring-only mode: %s", e)
         voice_call.AVAILABLE = False
+    try:  # fill the entity cache so the poller/catch-up can address every channel
+        await user.get_dialogs(limit=None)
+    except Exception as e:
+        log.warning("get_dialogs failed (poller may skip some channels until they post): %s", e)
+    for n in range(ALERT_WORKERS):
+        spawn(alert_worker(n))
+    spawn(poller())
+    try:
+        await user.catch_up()
+    except Exception as e:
+        log.info("catch_up: %s", e)
     me = await user.get_me()
     log.info("Voice transcription: %s", "ON (" + transcribe.MODEL + ")" if transcribe.AVAILABLE else "OFF (no GROQ_API_KEY)")
     log.info("Userbot: %s | Bot: @%s", me.first_name, (await bot.get_me()).username)

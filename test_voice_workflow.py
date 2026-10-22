@@ -24,10 +24,17 @@ db.set_setting("call_target", "999")
 ch = {"title": "C", "id": 1, "username": None, "priority": 0}  # NOT a priority channel
 ev = N(file=N(duration=10, size=10, mime_type="audio/ogg", name=None, ext=".ogg"), voice=1, id=5, message=None)
 
-# 1. priority keyword in the CAPTION (transcript has none) -> forwarded + call, any channel
+# 1. priority keyword on a NON-priority channel -> forwarded as normal, NO call (strict rule)
 asyncio.run(bot.on_voice_post(ev, ch, "urgent update"))
 assert [c[0] for c in calls] == ["file"], calls
-assert len(spawned) == 1, "priority keyword must trigger the call from any watched channel"
+assert not spawned, "non-priority channel must never trigger a call"
+assert "PRIORITY" not in calls[0][1]["caption"]
+
+# 1b. priority keyword on a PRIORITY channel -> PRIORITY + call
+calls.clear()
+asyncio.run(bot.on_voice_post(ev, dict(ch, priority=1), "urgent update"))
+assert len(spawned) == 1 and "PRIORITY" in calls[0][1]["caption"]
+spawned.clear()
 
 # 2. normal keyword in the TRANSCRIPT (caption empty) -> forwarded, NO call
 calls.clear(); spawned.clear()

@@ -37,3 +37,8 @@ When `GEMINI_API_KEY` is set and you answer, Gemini greets you ("আসসাল
 Use a small always-on server (VPS, Railway, Render background worker, or a Raspberry Pi), for example
 `nohup python bot.py &`, or a systemd service. Data is stored in `botdata.sqlite3`.
 - See DEPLOY.md for 24/7 cloud hosting (Railway / Render).
+
+## v15 – Better voice matching (Banglish, dialects, informal speech)
+- Default transcription model is now `whisper-large-v3` (set `GROQ_TRANSCRIBE_MODEL=whisper-large-v3-turbo` for speed).
+- Whisper gets a language hint (Bangla + English mixed) plus your saved keywords, so it spells them the way you saved them. Customize with `GROQ_TRANSCRIBE_PROMPT`.
+- Voice transcripts use flexible matching: case/accent/punctuation-insensitive, common Bangla spelling variants (ী/ি, ূ/ু, শ/ষ/স, ণ/ন, ড়/র…) treated as equal, and fuzzy similarity (default 85%, `VOICE_FUZZY_THRESHOLD`). Keywords under 4 letters still need an exact word. Text posts keep strict matching.

@@ -14,17 +14,17 @@ class ModelTests(unittest.TestCase):
         with patch.dict(os.environ):
             os.environ.pop("GROQ_TRANSCRIBE_MODEL", None)
             importlib.reload(transcribe)
-            self.assertEqual(transcribe.MODEL, "whisper-large-v3-turbo")
+            self.assertEqual(transcribe.MODEL, "whisper-large-v3")
 
     def test_empty_model_uses_default(self):
         with patch.dict(os.environ, {"GROQ_TRANSCRIBE_MODEL": "  "}):
             importlib.reload(transcribe)
-            self.assertEqual(transcribe.MODEL, "whisper-large-v3-turbo")
+            self.assertEqual(transcribe.MODEL, "whisper-large-v3")
 
     def test_explicit_override_is_preserved(self):
-        with patch.dict(os.environ, {"GROQ_TRANSCRIBE_MODEL": "whisper-large-v3"}):
+        with patch.dict(os.environ, {"GROQ_TRANSCRIBE_MODEL": "whisper-large-v3-turbo"}):
             importlib.reload(transcribe)
-            self.assertEqual(transcribe.MODEL, "whisper-large-v3")
+            self.assertEqual(transcribe.MODEL, "whisper-large-v3-turbo")
 
     def test_unavailable_without_key_returns_empty(self):
         with patch.object(transcribe, "AVAILABLE", False):
@@ -42,6 +42,13 @@ class ModelTests(unittest.TestCase):
             kwargs = create.await_args.kwargs
             self.assertEqual(kwargs["model"], "whisper-large-v3-turbo")
             self.assertEqual(kwargs["file"], ("voice.ogg", b"audio"))
+            self.assertIn("Bangla", kwargs["prompt"])
+
+    def test_prompt_includes_keywords(self):
+        p = transcribe.build_prompt(["জরুরি", "urgent"])
+        self.assertIn("জরুরি", p)
+        self.assertIn("urgent", p)
+        self.assertLessEqual(len(transcribe.build_prompt(["x" * 50] * 50)), transcribe.PROMPT_MAX_CHARS)
 
     def test_mime_extension_mapping(self):
         self.assertEqual(transcribe._filename("audio/mpeg"), "voice.mp3")

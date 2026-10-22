@@ -104,7 +104,7 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(send.await_args.kwargs["voice_note"])
         self.assertIn("spokenword", send.await_args.kwargs["caption"])
         self.assertIn("captionword", send.await_args.kwargs["caption"])
-        self.assertEqual(db.hit_totals(), {"total": 2, "prio": 1, "voice": 2})
+        self.assertEqual(db.hit_totals(), {"total": 2, "prio": 0, "voice": 2})
         self.assertEqual({r["word"] for r in db.top_voice_keywords()}, {"spokenword", "captionword"})
 
 

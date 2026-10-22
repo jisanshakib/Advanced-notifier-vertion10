@@ -5,5 +5,7 @@ psycopg[binary]>=3.1,<4
 google-genai>=1.20,<2
 # Groq Whisper (voice-message transcription from watched channels)
 groq>=0.11,<1
+# Fuzzy keyword matching for voice transcripts
+rapidfuzz>=3.0,<4
 py-tgcalls>=2.2,<3
 numpy>=1.26,<3
