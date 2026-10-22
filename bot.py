@@ -27,6 +27,7 @@ import db
 import transcribe
 import matching
 import voice_call
+import hosting
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
 
@@ -902,63 +903,11 @@ async def run_call(target, reason, post=None):
 
 # ------------------------------------------------------------------ main
 async def health_server():
-    """Tiny HTTP 200 responder so web-service hosts (Render/Koyeb) see the app as healthy."""
-    port = os.getenv("PORT")
-    if not port:
-        return
-    async def handle(reader, writer):
-        try:
-            await asyncio.wait_for(reader.read(1024), 10)  # slow/idle clients can't pin sockets
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n"
-                         b"Connection: close\r\n\r\nOK")
-            await writer.drain()
-        except Exception:
-            pass
-        finally:
-            writer.close()
-    server = await asyncio.start_server(handle, "0.0.0.0", int(port))
-    log.info("Health check listening on :%s", port)
-    return server
-
-
-# ------------------------------------------------------------------ keep-alive
-PING_INTERVAL = 600  # seconds — Render's free web services idle out after ~15 min
-
-
-def _ping_once(url: str) -> None:
-    """One blocking HTTP GET. Runs in a worker thread, never on the event loop."""
-    import urllib.error
-    import urllib.request
-
-    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "keep-alive-ping"})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            resp.read()
-            log.info("Keep-alive ping OK: %s", resp.status)
-    except Exception as e:
-        # Any failure (timeout, DNS, 5xx, offline host) is logged and ignored —
-        # a missed ping must never stop the bot or touch message processing.
-        log.warning("Keep-alive ping failed (ignored): %s", e)
+    return await hosting.start_health_server()
 
 
 async def keep_alive():
-    """Self-ping every PING_INTERVAL so Render doesn't idle-out the free web service.
-
-    Skips entirely when RENDER_EXTERNAL_URL is not set (local runs, Railway, Docker).
-    """
-    url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
-    if not url:
-        log.info("RENDER_EXTERNAL_URL not set — keep-alive self-ping disabled.")
-        return
-    log.info("Keep-alive enabled: pinging %s every %ds.", url, PING_INTERVAL)
-    while not _stop.is_set():
-        # to_thread keeps the network call off the event loop, so Telegram
-        # updates are never blocked by a slow or hanging ping.
-        await asyncio.to_thread(_ping_once, url)  # bounded by the 20 s timeout -> no zombie thread
-        try:
-            await asyncio.wait_for(_stop.wait(), PING_INTERVAL)  # wakes instantly on shutdown
-        except asyncio.TimeoutError:
-            pass
+    await hosting.keep_alive(_stop)
 
 
 _stop: asyncio.Event  # set on SIGTERM/SIGINT; created inside the running loop
@@ -974,44 +923,56 @@ async def main():
         except (NotImplementedError, RuntimeError):
             pass  # Windows
     server = await health_server()
-    spawn(keep_alive())
-    if _USER_SESSION:
-        await user.connect()
-        if not await user.is_user_authorized():
-            raise SystemExit("USER_SESSION is invalid or expired. Run login_session.py again.")
-    else:
-        await user.start()  # local run: asks for phone number + code in the console
-    await bot.start(bot_token=BOT_TOKEN)
-    caller.install(user)
+    runners = []
     try:
-        await voice_call.install(user)
-    except Exception as e:  # never let the voice add-on stop the bot
-        log.exception("voice call setup failed, ring-only mode: %s", e)
-        voice_call.AVAILABLE = False
-    try:  # fill the entity cache so the poller/catch-up can address every channel
-        await user.get_dialogs(limit=None)
-    except Exception as e:
-        log.warning("get_dialogs failed (poller may skip some channels until they post): %s", e)
-    for n in range(ALERT_WORKERS):
-        spawn(alert_worker(n))
-    spawn(poller())
-    try:
-        await user.catch_up()
-    except Exception as e:
-        log.info("catch_up: %s", e)
-    me = await user.get_me()
-    log.info("Voice transcription: %s", "ON (" + transcribe.MODEL + ")" if transcribe.AVAILABLE else "OFF (no GROQ_API_KEY)")
-    log.info("Userbot: %s | Bot: @%s", me.first_name, (await bot.get_me()).username)
-    runners = [asyncio.create_task(user.run_until_disconnected()),
-               asyncio.create_task(bot.run_until_disconnected()),
-               asyncio.create_task(_stop.wait())]
-    try:
-        done, _ = await asyncio.wait(runners, return_when=asyncio.FIRST_COMPLETED)
-        for t in done:  # a client dropped for good -> exit non-zero so the host restarts us
-            if not t.cancelled() and t.exception():
-                log.error("client stopped: %r", t.exception())
+        spawn(keep_alive())
+        if _USER_SESSION:
+            await user.connect()
+            if not await user.is_user_authorized():
+                raise SystemExit("USER_SESSION is invalid or expired. Run login_session.py again.")
+        else:
+            await user.start()  # local run: asks for phone number + code in the console
+        await bot.start(bot_token=BOT_TOKEN)
+        caller.install(user)
+        try:
+            await voice_call.install(user)
+        except Exception as e:  # never let the voice add-on stop the bot
+            log.exception("voice call setup failed, ring-only mode: %s", e)
+            voice_call.AVAILABLE = False
+        try:  # fill the entity cache so the poller/catch-up can address every channel
+            await user.get_dialogs(limit=None)
+        except Exception as e:
+            log.warning("get_dialogs failed (poller may skip some channels until they post): %s", e)
+        for n in range(ALERT_WORKERS):
+            spawn(alert_worker(n))
+        spawn(poller())
+        try:
+            await user.catch_up()
+        except Exception as e:
+            log.info("catch_up: %s", e)
+        me = await user.get_me()
+        log.info("Voice transcription: %s", "ON (" + transcribe.MODEL + ")" if transcribe.AVAILABLE else "OFF (no GROQ_API_KEY)")
+        log.info("Userbot: %s | Bot: @%s", me.first_name, (await bot.get_me()).username)
+        runners = [asyncio.create_task(user.run_until_disconnected()),
+                   asyncio.create_task(bot.run_until_disconnected()),
+                   asyncio.create_task(_stop.wait())]
+        await wait_for_clients(runners)
     finally:
         await shutdown(server, runners)
+
+
+async def wait_for_clients(runners):
+    """A deliberate stop is clean; a terminal client disconnect must fail."""
+    done, _ = await asyncio.wait(runners, return_when=asyncio.FIRST_COMPLETED)
+    if _stop.is_set():
+        return
+    for task in done:
+        if task.cancelled():
+            raise RuntimeError("Telegram client unexpectedly cancelled")
+        error = task.exception()
+        if error is not None:
+            raise RuntimeError("Telegram client stopped unexpectedly") from error
+    raise RuntimeError("Telegram client disconnected unexpectedly")
 
 
 async def shutdown(server, runners):
@@ -1020,7 +981,11 @@ async def shutdown(server, runners):
     _stop.set()
     if server is not None:
         server.close()
-    await voice_call.shutdown()
+        await server.wait_closed()
+    try:
+        await asyncio.wait_for(voice_call.shutdown(), 15)
+    except Exception:
+        log.warning("Voice cleanup failed or timed out; continuing shutdown")
     for t in list(_bg_tasks):
         t.cancel()
     await asyncio.gather(*_bg_tasks, return_exceptions=True)

@@ -3,6 +3,10 @@ local disk is wiped on every restart). Otherwise falls back to a local SQLite fi
 import os
 import sqlite3
 import threading
+import time
+import logging
+
+log = logging.getLogger("db")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
@@ -14,7 +18,7 @@ if PG:
 
     IntegrityError = psycopg.IntegrityError
 
-    def _connect():
+    def _connect_once():
         # prepare_threshold=None: Supabase/PgBouncer transaction pooler (port 6543) breaks
         #   server-side prepared statements ("prepared statement ... already exists").
         # keepalives: detect connections silently dropped by NAT/poolers after long idle.
@@ -22,6 +26,17 @@ if PG:
                                prepare_threshold=None, connect_timeout=10,
                                keepalives=1, keepalives_idle=30, keepalives_interval=10,
                                keepalives_count=3)
+
+    def _connect():
+        # Bounded retries cover a waking database or a brief pooler outage.
+        for attempt in range(3):
+            try:
+                return _connect_once()
+            except (psycopg.OperationalError, psycopg.InterfaceError):
+                if attempt == 2:
+                    raise
+                log.warning("Database connection unavailable; retrying")
+                time.sleep(2 ** attempt)
 
     _conn = _connect()
     _SCHEMA = [
@@ -61,18 +76,29 @@ def q(sql, args=(), one=False):
     global _conn
     with _lock:
         if PG:
+            # Check the idle connection BEFORE sending a write. Replaying a write
+            # after a lost acknowledgement could duplicate hits or flip priority twice.
+            is_read = sql.lstrip().upper().startswith("SELECT ")
             try:
                 if _conn.closed:
                     raise psycopg.OperationalError("connection closed")
+                if not is_read:
+                    _conn.execute("SELECT 1")
+            except (psycopg.OperationalError, psycopg.InterfaceError):
+                _reconnect()
+            try:
                 cur = _conn.execute(sql, args)
                 rows = cur.fetchall() if cur.description else []
             except (psycopg.OperationalError, psycopg.InterfaceError):
-                # idle connection dropped by the server/pooler -> reconnect once and retry
-                try:
-                    _conn.close()
-                except Exception:
-                    pass
-                _conn = _connect()
+                if not is_read:
+                    # Outcome may be ambiguous; don't replay non-idempotent writes.
+                    # Subsequent calls will reconnect via the preflight probe.
+                    try:
+                        _conn.close()
+                    except Exception:
+                        pass
+                    raise
+                _reconnect()
                 cur = _conn.execute(sql, args)
                 rows = cur.fetchall() if cur.description else []
         else:
@@ -84,6 +110,17 @@ def q(sql, args=(), one=False):
                 _conn.rollback()
                 raise
     return (rows[0] if rows else None) if one else rows
+
+
+def _reconnect():
+    """Caller holds _lock. Never log the connection URL or credentials."""
+    global _conn
+    try:
+        _conn.close()
+    except Exception:
+        pass
+    _conn = _connect()
+    log.info("Database connection restored")
 
 
 def close():

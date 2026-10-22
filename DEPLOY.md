@@ -39,11 +39,27 @@ Note: Railway gives trial credit, then about $5/month on the Hobby plan. A bot l
 1. render.com → New → **Blueprint** → pick the repo. It reads `render.yaml`.
 2. Fill in the env values it asks for (`API_ID`, `API_HASH`, `BOT_TOKEN`, `USER_SESSION`, `DATABASE_URL`).
 3. Deploy, then check **Logs**.
-4. **Keep it awake:** The bot now pings its own Render URL every 10 minutes
-   automatically (it uses the `RENDER_EXTERNAL_URL` variable Render sets for you —
-   no setup needed). Free Render services sleep after 15 minutes without *external*
-   visits, so also create a free monitor at uptimerobot.com (or cron-job.org)
-   that opens your Render URL (e.g. `https://telegram-alert-bot.onrender.com`) every 5 minutes.
+4. Set **Settings → Health Check Path** to `/healthz` for an existing service.
+   The server listens on Render's `PORT`, and answers `GET /healthz` and `GET /`
+   with HTTP 200 and `OK`, without contacting Telegram or the database.
+5. Best-effort self-pings run asynchronously every **5 minutes**, using
+   `RENDER_EXTERNAL_URL` automatically. Override the base URL with `KEEP_ALIVE_URL`,
+   the interval with `KEEP_ALIVE_INTERVAL` (30–600 seconds), or disable them with
+   `KEEP_ALIVE_ENABLED=false`. Each request has a 10-second total timeout, and
+   failures don't stop the bot. No new credentials are needed.
+6. **For reliable 24/7 operation, upgrade the Render service to paid always-on
+   compute.** Free services can sleep after 15 minutes without inbound traffic;
+   a self-ping cannot run after the process sleeps, health checks do not prevent
+   free-tier sleep, and free-tier limits/restarts still apply. An external monitor
+   may help with idle traffic but is not an uptime guarantee. See
+   https://render.com/docs/free and https://render.com/docs/faq.
+
+Database connections retain TCP keepalives and now retry connection establishment
+up to three times. Stale connections are checked before writes and restored;
+reads may be retried once. A write whose acknowledgement was lost is NOT blindly
+replayed (avoids duplicate statistics or double priority toggles). A persistent
+database outage still makes that operation fail; later operations can reconnect.
+Health checks deliberately do not claim that Telegram or the database is ready.
 
 Paid Render users can instead change `type: web` to `type: worker` in `render.yaml` and remove `healthCheckPath`.
 
